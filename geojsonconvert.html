@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Image to GeoJSON Converter</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    canvas { border: 1px solid #ccc; margin-top: 10px; display: block; }
+    .input-group { margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Image to GeoJSON Converter</h1>
+  
+  <div class="input-group">
+    <label for="imageInput">Upload Image:</label>
+    <input type="file" id="imageInput" accept="image/*">
+  </div>
+  
+  <div class="input-group">
+    <label for="projectionSelect">Projection:</label>
+    <select id="projectionSelect">
+      <option value="equirectangular">Equirectangular</option>
+      <option value="mercator">Mercator</option>
+    </select>
+  </div>
+  
+  <div class="input-group">
+    <label>Geographic Bounds (in degrees):</label><br>
+    <!-- For a full global map at 2° per pixel, use: top=90, left=-180, bottom=-90, right=180 -->
+    <label for="top">Top (lat):</label>
+    <input type="number" id="top" step="any" value="90">
+    <label for="left">Left (lon):</label>
+    <input type="number" id="left" step="any" value="-180"><br>
+    <label for="bottom">Bottom (lat):</label>
+    <input type="number" id="bottom" step="any" value="-90">
+    <label for="right">Right (lon):</label>
+    <input type="number" id="right" step="any" value="180">
+  </div>
+  
+  <div class="input-group">
+    <label for="shift">Vertical Shift (deg):</label>
+    <input type="number" id="shift" step="any" value="0">
+    <span>(Positive shifts image up)</span>
+  </div>
+  
+  <div class="input-group">
+    <label for="horShift">Horizontal Shift (deg):</label>
+    <input type="number" id="horShift" step="any" value="0">
+    <span>(Positive shifts image right; wraps around)</span>
+  </div>
+  
+  <div class="input-group">
+    <label for="pixelSize">Pixel Size (deg per pixel):</label>
+    <input type="number" id="pixelSize" step="any" value="2">
+    <span>(Canvas dimensions will be 360 ÷ pixelSize by 180 ÷ pixelSize)</span>
+  </div>
+  
+  <div class="input-group">
+    <label for="lightnessCheckbox">Use Lightness as Value:</label>
+    <input type="checkbox" id="lightnessCheckbox">
+    <span>(If checked, each polygon's property "value" is set to lightness (0–1). Otherwise, "color" is set as a hex string.)</span>
+  </div>
+  
+  <button id="processButton">Convert to GeoJSON</button>
+  
+  <div id="status">
+    <p>Current task: <span id="currentTask">Idle</span></p>
+  </div>
+  
+  <canvas id="imageCanvas"></canvas>
+  
+  <script>
+    // Union-Find (Disjoint Set) Class
+    class UnionFind {
+      constructor(size) {
+        this.parent = new Uint32Array(size);
+        this.rank = new Uint8Array(size);
+        for (let i = 0; i < size; i++) {
+          this.parent[i] = i;
+          this.rank[i] = 0;
+        }
+      }
+      find(x) {
+        if (this.parent[x] !== x) {
+          this.parent[x] = this.find(this.parent[x]);
+        }
+        return this.parent[x];
+      }
+      union(a, b) {
+        const rootA = this.find(a);
+        const rootB = this.find(b);
+        if (rootA === rootB) return rootA;
+        if (this.rank[rootA] < this.rank[rootB]) {
+          this.parent[rootA] = rootB;
+          return rootB;
+        } else if (this.rank[rootA] > this.rank[rootB]) {
+          this.parent[rootB] = rootA;
+          return rootA;
+        } else {
+          this.parent[rootB] = rootA;
+          this.rank[rootA]++;
+          return rootA;
+        }
+      }
+    }
+
+    // Global Variables & UI Elements
+    const imageInput = document.getElementById('imageInput');
+    const processButton = document.getElementById('processButton');
+    const currentTaskElem = document.getElementById('currentTask');
+    const canvas = document.getElementById('imageCanvas');
+    const ctx = canvas.getContext('2d');
+    let img = new Image();
+
+    // Processing variables
+    let width, height, totalSize, pixels;
+    let colorArr;    // Array of color strings (or null for white)
+    let labelArr;    // Uint32Array for provisional labels
+    let unionFind;   // Union-find structure
+    let nextLabel = 1;
+    let pass1y = 0;  // Row counter for first pass
+    let pass2y = 0;  // Row counter for second pass
+    let bounds = {}; // Geographic bounds: {top, left, bottom, right}
+    let labelToColor = {};  // Map from provisional label to pixel color (string)
+    let projection = "equirectangular"; // Default projection
+    let pixelSize = 2; // Default pixel size (deg per pixel)
+
+    // Global offsets (for drawn image area relative to canvas)
+    let globalOffsetX = 0;
+    let globalOffsetY = 0;
+
+    // Image Loading
+    imageInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = function(evt) {
+          img.onload = function() {
+            // Image loaded; waiting for Convert click.
+          }
+          img.src = evt.target.result;
+        }
+        reader.readAsDataURL(file);
+      }
+    });
+
+    // Helper Functions
+    // Return the color string for pixel (x,y) as "r,g,b,a"
+    function getColor(x, y, pixels, width) {
+      const idx = (y * width + x) * 4;
+      const r = pixels[idx], g = pixels[idx+1], b = pixels[idx+2], a = pixels[idx+3];
+      return r + "," + g + "," + b + "," + a;
+    }
+
+    // Build a color array for the entire image.
+    // White pixels (255,255,255,255) are marked as null.
+    function buildColorArray(pixels, width, height) {
+      const size = width * height;
+      const arr = new Array(size);
+      for (let i = 0; i < size; i++) {
+        const idx = i * 4;
+        const r = pixels[idx], g = pixels[idx+1], b = pixels[idx+2], a = pixels[idx+3];
+        arr[i] = (r === 255 && g === 255 && b === 255 && a === 255)
+          ? null
+          : (r + "," + g + "," + b + "," + a);
+      }
+      return arr;
+    }
+
+    // Helper: Convert a color string "r,g,b,a" to its lightness (0 to 1)
+    function colorLightness(colorStr) {
+      const parts = colorStr.split(',');
+      const r = parseInt(parts[0]);
+      const g = parseInt(parts[1]);
+      const b = parseInt(parts[2]);
+      const maxVal = Math.max(r, g, b);
+      const minVal = Math.min(r, g, b);
+      const L = (maxVal + minVal) / (2 * 255);
+      return parseFloat(L.toFixed(3));
+    }
+
+    // Helper: Convert a color string "r,g,b,a" to hexadecimal (without the hashtag)
+    function colorToHex(colorStr) {
+      const parts = colorStr.split(',');
+      const r = parseInt(parts[0]);
+      const g = parseInt(parts[1]);
+      const b = parseInt(parts[2]);
+      const hr = r.toString(16).padStart(2, '0');
+      const hg = g.toString(16).padStart(2, '0');
+      const hb = b.toString(16).padStart(2, '0');
+      return (hr + hg + hb).toUpperCase();
+    }
+
+    // Convert pixel (x,y) to geographic coordinate.
+    // For equirectangular: lon = left + (x - globalOffsetX)*pixelSize, lat = top - (y - globalOffsetY)*pixelSize.
+    // (After Mercator reproject, conversion is linear.)
+    function pixelToGeo(x, y, bounds, projection) {
+      const effectiveX = x - globalOffsetX;
+      const effectiveY = y - globalOffsetY;
+      let lon = bounds.left + effectiveX * pixelSize;
+      let lat = bounds.top - effectiveY * pixelSize;
+      return [lon, lat];
+    }
+
+    // Build Final Canvas with Fixed Dimensions
+    // Final canvas dimensions are based on the pixelSize:
+    // width = 360 / pixelSize, height = 180 / pixelSize.
+    function buildFinalCanvas() {
+      const targetWidth = Math.round(360 / pixelSize);
+      const targetHeight = Math.round(180 / pixelSize);
+      // Create a temporary canvas that is double the width for horizontal wrapping.
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = targetWidth * 2;
+      tempCanvas.height = targetHeight;
+      const tempCtx = tempCanvas.getContext('2d');
+      // Fill with white.
+      tempCtx.fillStyle = "white";
+      tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+      
+      // Determine scale to preserve image aspect ratio.
+      let scale = Math.min(targetWidth / img.width, targetHeight / img.height);
+      const resampledWidth = Math.floor(img.width * scale);
+      const resampledHeight = Math.floor(img.height * scale);
+      
+      // Get vertical and horizontal shift values (in degrees) from input.
+      const vShiftDegrees = parseFloat(document.getElementById('shift').value) || 0;
+      const vShiftPixels = Math.round(vShiftDegrees / pixelSize);
+      const hShiftDegrees = parseFloat(document.getElementById('horShift').value) || 0;
+      const hShiftPixels = Math.round(hShiftDegrees / pixelSize);
+      
+      // Center the image in the target canvas.
+      const baseOffsetX = Math.floor((targetWidth - resampledWidth) / 2);
+      const baseOffsetY = Math.floor((targetHeight - resampledHeight) / 2);
+      const offsetX = baseOffsetX - hShiftPixels;
+      const offsetY = baseOffsetY - vShiftPixels;
+      // Store these offsets for later conversion.
+      globalOffsetX = offsetX;
+      globalOffsetY = offsetY;
+      
+      // Draw the image twice (for horizontal wrapping).
+      tempCtx.drawImage(img, 0, 0, img.width, img.height, offsetX, offsetY, resampledWidth, resampledHeight);
+      tempCtx.drawImage(img, 0, 0, img.width, img.height, offsetX + targetWidth, offsetY, resampledWidth, resampledHeight);
+      
+      // Extract the final canvas slice.
+      const finalCanvas = document.createElement('canvas');
+      finalCanvas.width = targetWidth;
+      finalCanvas.height = targetHeight;
+      const finalCtx = finalCanvas.getContext('2d');
+      finalCtx.drawImage(tempCanvas, 0, 0, targetWidth, targetHeight, 0, 0, targetWidth, targetHeight);
+      return finalCanvas;
+    }
+
+    // Two-Pass Connected Component Labeling
+    function firstPassRow() {
+      if (pass1y >= height) {
+        currentTaskElem.textContent = "Consolidating labels (2nd pass)...";
+        setTimeout(secondPassRow, 0);
+        return;
+      }
+      currentTaskElem.textContent = `First pass: row ${pass1y + 1} of ${height}`;
+      for (let x = 0; x < width; x++) {
+        const idx = pass1y * width + x;
+        if (colorArr[idx] === null) {
+          labelArr[idx] = 0;
+          continue;
+        }
+        if (labelArr[idx] === 0) {
+          labelArr[idx] = nextLabel;
+          nextLabel++;
+        }
+        const myLabel = labelArr[idx];
+        if (x > 0) {
+          const leftIdx = idx - 1;
+          if (colorArr[leftIdx] === colorArr[idx] && labelArr[leftIdx] !== 0) {
+            unionFind.union(myLabel, labelArr[leftIdx]);
+          }
+        }
+        if (pass1y > 0) {
+          const topIdx = idx - width;
+          if (colorArr[topIdx] === colorArr[idx] && labelArr[topIdx] !== 0) {
+            unionFind.union(myLabel, labelArr[topIdx]);
+          }
+        }
+        labelToColor[myLabel] = colorArr[idx];
+      }
+      pass1y++;
+      setTimeout(firstPassRow, 0);
+    }
+
+    function secondPassRow() {
+      if (pass2y >= height) {
+        currentTaskElem.textContent = "Grouping connected pixels...";
+        setTimeout(buildRegions, 0);
+        return;
+      }
+      for (let x = 0; x < width; x++) {
+        const idx = pass2y * width + x;
+        if (labelArr[idx] !== 0) {
+          labelArr[idx] = unionFind.find(labelArr[idx]);
+        }
+      }
+      pass2y++;
+      currentTaskElem.textContent = `Second pass: row ${pass2y} of ${height}`;
+      setTimeout(secondPassRow, 0);
+    }
+
+    function buildRegions() {
+      const regionMap = new Map();
+      for (let i = 0; i < totalSize; i++) {
+        const lbl = labelArr[i];
+        if (lbl === 0) continue;
+        if (!regionMap.has(lbl)) {
+          regionMap.set(lbl, []);
+        }
+        const x = i % width;
+        const y = Math.floor(i / width);
+        regionMap.get(lbl).push([x, y]);
+      }
+      currentTaskElem.textContent = "Building bounding boxes...";
+      setTimeout(() => finalizeGeoJSON(regionMap), 0);
+    }
+
+    // Updated regionToBoundingBox ensures non-degenerate boxes.
+    function regionToBoundingBox(pixelsArr) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const [x, y] of pixelsArr) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+      if (minX === maxX) { maxX = minX + 1; }
+      if (minY === maxY) { maxY = minY + 1; }
+      return [
+        [minX, minY],
+        [maxX, minY],
+        [maxX, maxY],
+        [minX, maxY],
+        [minX, minY]
+      ];
+    }
+
+    function finalizeGeoJSON(regionMap) {
+      const features = [];
+      let polygonId = 1;
+      // Check if lightness mode is enabled.
+      const useLightness = document.getElementById("lightnessCheckbox").checked;
+      for (const [lbl, pixArr] of regionMap.entries()) {
+        const boxPixels = regionToBoundingBox(pixArr);
+        const coords = boxPixels.map(([px, py]) => pixelToGeo(px, py, bounds, projection));
+        let properties = { id: polygonId, label: lbl };
+        if (useLightness) {
+          // Use the lightness from the polygon's color (all pixels in a region have the same color).
+          properties.value = colorLightness(labelToColor[lbl]);
+        } else {
+          properties.color = colorToHex(labelToColor[lbl]);
+        }
+        features.push({
+          type: "Feature",
+          properties: properties,
+          geometry: { type: "Polygon", coordinates: [coords] }
+        });
+        polygonId++;
+      }
+      currentTaskElem.textContent = "Generating GeoJSON...";
+      const geojson = { type: "FeatureCollection", features: features };
+      const geojsonStr = JSON.stringify(geojson, null, 2);
+      const blob = new Blob([geojsonStr], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "output.geojson";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      currentTaskElem.textContent = "Done";
+      processButton.disabled = false;
+      alert("GeoJSON file has been downloaded!");
+    }
+
+    // Process Button Event
+    processButton.addEventListener('click', () => {
+      if (!img.src) {
+        alert("Please upload an image first.");
+        return;
+      }
+      processButton.disabled = true;
+      currentTaskElem.textContent = "Resampling image...";
+      polygonId = 1;
+      labelToColor = {};
+
+      // Read geographic bounds.
+      bounds.top = parseFloat(document.getElementById('top').value);
+      bounds.left = parseFloat(document.getElementById('left').value);
+      bounds.bottom = parseFloat(document.getElementById('bottom').value);
+      bounds.right = parseFloat(document.getElementById('right').value);
+
+      // Read selected projection.
+      projection = document.getElementById('projectionSelect').value;
+
+      // Read pixel size.
+      pixelSize = parseFloat(document.getElementById('pixelSize').value) || 2;
+
+      // Build final canvas with fixed dimensions based on pixelSize:
+      // width = 360 / pixelSize, height = 180 / pixelSize.
+      const finalCanvas = buildFinalCanvas();
+      // If Mercator is selected, reproject the final canvas.
+      let processedCanvas = finalCanvas;
+      if (projection === "mercator") {
+        processedCanvas = reprojectMercator(finalCanvas);
+      }
+      // Use processed canvas dimensions as our working dimensions.
+      width = processedCanvas.width;
+      height = processedCanvas.height;
+      totalSize = width * height;
+      // Display the processed canvas.
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(processedCanvas, 0, 0);
+
+      // Retrieve image data.
+      const imageData = processedCanvas.getContext('2d').getImageData(0, 0, width, height);
+      pixels = imageData.data;
+
+      // Build the color array.
+      colorArr = buildColorArray(pixels, width, height);
+
+      // Initialize label array and union-find.
+      labelArr = new Uint32Array(totalSize);
+      unionFind = new UnionFind(100000);
+      nextLabel = 1;
+      pass1y = 0;
+      pass2y = 0;
+      currentTaskElem.textContent = `First pass: row 1 of ${height}`;
+      setTimeout(firstPassRow, 0);
+    });
+  </script>
+</body>
+</html>
