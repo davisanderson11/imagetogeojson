@@ -7,8 +7,8 @@
     body { font-family: Arial, sans-serif; margin: 20px; }
     canvas { border: 1px solid #ccc; margin-top: 10px; display: block; }
     .input-group { margin-bottom: 10px; }
-    #keyMappingSection { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; }
-    .keyRow { margin-bottom: 5px; }
+    #keyMappingSection, #polygonPropertiesSection { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; }
+    .keyRow, .propertyRow { margin-bottom: 5px; }
   </style>
 </head>
 <body>
@@ -72,10 +72,29 @@
     <button id="addKeyButton">Add Key</button>
   </div>
   
+  <!-- New Polygon Properties Section -->
+  <div id="polygonPropertiesSection">
+    <h3>Polygon Properties</h3>
+    <div class="input-group">
+      <label for="keyMappingFieldName">Key Mapping Field Name:</label>
+      <input type="text" id="keyMappingFieldName" value="value">
+      <span>(Field name for key mapping output)</span>
+    </div>
+    <div id="additionalPropertiesContainer">
+      <!-- A default property row (can be removed) -->
+      <div class="propertyRow">
+        <input type="text" class="propertyKey" placeholder="Field name">
+        <input type="text" class="propertyValue" placeholder="Field value">
+        <button class="removePropertyButton" onclick="removePropertyRow(this)">Remove</button>
+      </div>
+    </div>
+    <button id="addPropertyButton">Add Additional Property</button>
+  </div>
+  
   <div class="input-group">
     <label for="lightnessCheckbox">Use Lightness as Value:</label>
     <input type="checkbox" id="lightnessCheckbox">
-    <span>(If checked, each polygon's property "value" is set to lightness (0–1). Otherwise, "value" is set to the key mapping label.)</span>
+    <span>(If checked, the polygon's property will be set to lightness (0–1) instead of the key mapping label.)</span>
   </div>
   
   <button id="processButton">Convert to GeoJSON</button>
@@ -105,6 +124,25 @@
     }
     
     document.getElementById('addKeyButton').addEventListener('click', addKeyRow);
+    
+    // ---------------------------
+    // Polygon Properties UI Functions
+    // ---------------------------
+    function removePropertyRow(button) {
+      button.parentElement.remove();
+    }
+    
+    function addPropertyRow() {
+      const container = document.getElementById("additionalPropertiesContainer");
+      const div = document.createElement("div");
+      div.className = "propertyRow";
+      div.innerHTML = '<input type="text" class="propertyKey" placeholder="Field name"> ' +
+                      '<input type="text" class="propertyValue" placeholder="Field value"> ' +
+                      '<button class="removePropertyButton" onclick="removePropertyRow(this)">Remove</button>';
+      container.appendChild(div);
+    }
+    
+    document.getElementById("addPropertyButton").addEventListener("click", addPropertyRow);
     
     // Retrieve key mapping: returns an array of objects { keyColor: "#RRGGBB", value: "label" }
     function getKeyMapping() {
@@ -221,8 +259,8 @@
     let projection = "equirectangular";
     let pixelSize = 2;
     
-    // These global offsets are used to map canvas coordinates to geographic coordinates.
-    // We now force them to 0 after extracting the final canvas so that y=0 corresponds to 90°N and y=canvas height to –90°.
+    // Global offsets (for mapping canvas coordinates to geographic coordinates)
+    // They are adjusted after tiling so that (0,0) corresponds to the top-left (90°N, -180°W)
     let globalOffsetX = 0;
     let globalOffsetY = 0;
     
@@ -285,7 +323,7 @@
       return (hr + hg + hb).toUpperCase();
     }
     
-    // The conversion from canvas coordinates to geographic coordinates remains the same.
+    // Convert canvas pixel (x,y) to geographic coordinate.
     function pixelToGeo(x, y, bounds, projection) {
       const effectiveX = x - globalOffsetX;
       const effectiveY = y - globalOffsetY;
@@ -295,14 +333,14 @@
     }
     
     // ---------------------------
-    // Updated buildFinalCanvas: Tile the image 3x3 and extract the central tile.
-    // After extraction, force globalOffsetX/Y to 0 so that (0,0) maps to 90°N, –180°W.
+    // Updated buildFinalCanvas: Tile the image in a 3x3 grid and extract the central tile.
+    // After extraction, force globalOffsetX and globalOffsetY to 0.
     // ---------------------------
     function buildFinalCanvas() {
       const targetWidth = Math.round(360 / pixelSize);
       const targetHeight = Math.round(180 / pixelSize);
       
-      // Create a temporary canvas 3x larger than the target to allow for tiling.
+      // Create a temporary canvas 3x larger than the target.
       const tempCanvas = document.createElement('canvas');
       tempCanvas.width = targetWidth * 3;
       tempCanvas.height = targetHeight * 3;
@@ -327,7 +365,7 @@
       const offsetX = baseOffsetX - hShiftPixels;
       const offsetY = baseOffsetY - vShiftPixels;
       
-      // Draw the image in a 3x3 grid.
+      // Tile the image in a 3x3 grid.
       for (let i = 0; i < 3; i++) {
         for (let j = 0; j < 3; j++) {
           const dx = offsetX + i * targetWidth;
@@ -336,14 +374,14 @@
         }
       }
       
-      // Extract the central tile as the final canvas.
+      // Extract the central tile.
       const finalCanvas = document.createElement('canvas');
       finalCanvas.width = targetWidth;
       finalCanvas.height = targetHeight;
       const finalCtx = finalCanvas.getContext('2d');
       finalCtx.drawImage(tempCanvas, targetWidth, targetHeight, targetWidth, targetHeight, 0, 0, targetWidth, targetHeight);
       
-      // Force offsets to 0 so that (0,0) corresponds to the top-left of the world.
+      // Force global offsets to 0 so that (0,0) maps directly.
       globalOffsetX = 0;
       globalOffsetY = 0;
       
@@ -472,19 +510,37 @@
       setTimeout(() => finalizeGeoJSON(regionMap), 0);
     }
     
+    // ---------------------------
+    // Finalize GeoJSON: Use user-defined property names.
+    // ---------------------------
     function finalizeGeoJSON(regionMap) {
       const features = [];
       let polygonId = 1;
       const useLightness = document.getElementById("lightnessCheckbox").checked;
+      
       for (const [lbl, pixArr] of regionMap.entries()) {
         const polyCells = regionToPolygon(pixArr);
         const coords = polyCells.map(([px, py]) => pixelToGeo(px, py, bounds, projection));
+        
+        // Create the properties object using user-defined fields.
         let properties = { id: polygonId };
+        const keyFieldName = document.getElementById("keyMappingFieldName").value.trim() || "value";
         if (useLightness) {
-          properties.value = colorLightness(labelToColor[lbl]);
+          properties[keyFieldName] = colorLightness(labelToColor[lbl]);
         } else {
-          properties.value = labelToColor[lbl];
+          properties[keyFieldName] = labelToColor[lbl];
         }
+        
+        // Add any additional properties.
+        const additionalProps = document.querySelectorAll("#additionalPropertiesContainer .propertyRow");
+        additionalProps.forEach(row => {
+          const key = row.querySelector(".propertyKey").value.trim();
+          const val = row.querySelector(".propertyValue").value;
+          if (key !== "") {
+            properties[key] = val;
+          }
+        });
+        
         features.push({
           type: "Feature",
           properties: properties,
@@ -492,6 +548,7 @@
         });
         polygonId++;
       }
+      
       currentTaskElem.textContent = "Generating GeoJSON...";
       const geojson = { type: "FeatureCollection", features: features };
       const geojsonStr = JSON.stringify(geojson, null, 2);
@@ -545,7 +602,7 @@
       const imageData = processedCanvas.getContext('2d').getImageData(0, 0, width, height);
       pixels = imageData.data;
       
-      // Build the color array and normalize each non-white pixel using key mapping.
+      // Build the color array and assign key mapping labels.
       colorArr = buildColorArray(pixels, width, height);
       for (let i = 0; i < colorArr.length; i++) {
         if (colorArr[i] !== null) {
